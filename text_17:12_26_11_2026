@@ -1,0 +1,71 @@
+● I now have everything I need. Here's my complete answer to both parts.
+
+  ---
+
+  Parte 1: Qué modificar, dónde y cómo
+
+  Antes de darte los cambios exactos, hay algo importante que los logs cambian por completo (lo explico en la Parte 2):
+  el verdadero cuello de botella en estos runs NO es la VRAM de las copias especulativas, es el desborde del view heap y
+  el sync CPU. Pero como pediste los detalles concretos de lo que ya analicé, aquí van, y al final te digo cómo se
+  reordenan las prioridades según los logs.
+
+  Cambio 1 — Hacer SPECULATIVE_COPIES configurable (VRAM)
+
+  Dónde: crates/victory-gpu/src/memory.rs:70
+
+  Actual:
+  const SPECULATIVE_COPIES: usize = crate::descriptor::host::FIRST_RAW_PAGE_SLOTS as usize - 1;
+
+  Cómo (minimal, sin tocar config): bajar el valor a mano para probar:
+  const SPECULATIVE_COPIES: usize = 512; // era FIRST_RAW_PAGE_SLOTS - 1 = 1023
+
+  Cómo (prolijo, configurable): mover el valor a victory.toml y leerlo. En descriptor/host.rs o un módulo de config:
+  pub const SPECULATIVE_COPIES: usize = FIRST_RAW_PAGE_SLOTS as usize - 1;
+  y en memory.rs leer de config con default 1023. No es un one-liner; requiere cablear config.
+
+  Cambio 2 — El que REALMENTE importan los logs: subir el view heap cap
+
+  Dónde: crates/victory-gpu/src/descriptor/host.rs:894
+  const PORTABLE_VIEWS: u32 = 1_000_000;
+  El log dice literalmente: host view heap capped at 1000000; views past it read a null slot count=1245184. El juego
+  pide 1,245,184 views y 245,184 caen al slot null → basura renderizada. La doc del propio código (líneas 896-900) ya
+  dice que AMD usa UNCAPPED_VIEWS = 1<<21 (2,097,152). Subir PORTABLE_VIEWS a 1<<21 (o forzar la rama uncapped) elimina
+  el cap. Esto es un cambio de una línea y ataca el problema #1 de los logs.
+
+  ---
+
+  Parte 2: Opinión de los 4 logs
+
+  Leí los 4. Resumen de lo que muestran:
+
+  ┌───────────────┬───────────────────────────┬─────────┬───────────────────────────────────────────────────────────┐
+  │      Log      │          Qué es           │  GPU    │                        Señal clave                        │
+  │               │                           │  busy   │                                                           │
+  ├───────────────┼───────────────────────────┼─────────┼───────────────────────────────────────────────────────────┤
+  │ warm-...25980 │ warm-up / compilación de  │ —       │ guardó librería de 475 MB, 1012 pipelines cargados        │
+  │               │ shaders                   │         │                                                           │
+  ├───────────────┼───────────────────────────┼─────────┼───────────────────────────────────────────────────────────┤
+  │ run-...10792  │ run 4K + RT               │ 56–87%  │ view heap overflow 1.245M, 964+192+115 draws              │
+  │               │                           │         │ descartados/frame sin pipeline                            │
+  ├───────────────┼───────────────────────────┼─────────┼───────────────────────────────────────────────────────────┤
+  │ run-...12468  │ run                       │ 76–81%  │ "no room for new ones" (sin VRAM para texturas nuevas)    │
+  ├───────────────┼───────────────────────────┼─────────┼───────────────────────────────────────────────────────────┤
+  │ run-...22780  │ run                       │ 47–84%  │ 941 ms/frame, 650 MB comparados en CPU, sin VRAM para     │
+  │               │                           │         │ texturas                                                  │
+  └───────────────┴───────────────────────────┴─────────┴───────────────────────────────────────────────────────────┘
+
+  Lo que opino, en orden de importancia:
+
+  1. El view heap desbordado es el bug más grave y el más fácil de arreglar. 245K views leyendo null = corrupción visual
+     garantizada. Esto NO se arregla con SPECULATIVE_COPIES; se arregla con PORTABLE_VIEWS. Esta es tu mejor
+     contribución posible al proyecto — un cambio de una línea con evidencia directa en logs.
+  2. El cuello de botella es CPU, no GPU. La GPU está 47–87% pero los frames tardan 100–940 ms, con ExecuteCommandLists
+     y texture refreshes comiendo 5–15 ms/frame en CPU. Bajar SPECULATIVE_COPIES daría más faults de shader (más trabajo
+     CPU), empeorando esto. Por eso mi recomendación anterior de bajar copies era prematura para este caso.
+  3. Presión de VRAM real pero secundaria: "the card has no room for new ones" aparece en 2 de 3 runs — hay VRAM justa
+     (~8.4 GB budget, 9.1 GB usada). Aquí sí ayuda reducir copies, pero después de arreglar el view heap.
+  4. Pipelines caídos: cientos de draws/frame descartados por "prepare failed" / RT off. Son features no implementadas
+     (slots 0x218, 0x1c8), no algo que se arregle con tuning de memoria.
+
+  Conclusión accionable: la prioridad #1 para contribuir es el view heap cap (PORTABLE_VIEWS, host.rs:894), no
+  SPECULATIVE_COPIES. Ese es el cambio que yo mandaría al proyecto con estos logs como evidencia.
