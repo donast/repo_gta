@@ -1,0 +1,73 @@
+● Summary of Findings
+
+  Based on my analysis of the VIctory GPU memory system, here are the key findings for reducing frame time and VRAM
+  consumption:
+
+  Most Impactful Finding: SPECULATIVE_COPIES Constant
+
+  Location: crates/victory-gpu/src/memory.rs:70
+  const SPECULATIVE_COPIES: usize = crate::descriptor::host::FIRST_RAW_PAGE_SLOTS as usize - 1;
+  Current value: 1023 (since FIRST_RAW_PAGE_SLOTS = 1024)
+
+  This is the primary VRAM control knob - it directly limits the maximum number of copy pages, which directly controls
+  VRAM consumption.
+
+  How It Works
+
+  - When map_page() is called and copies.len() >= SPECULATIVE_COPIES, speculative mapping is skipped
+  - The speculative_skips counter is incremented
+  - Pages remain available for later allocation via roots, constants, or faults
+  - In populate(), the same limit applies mid-buffer with partial_copy tracking for later completion
+
+  Test-Verified Behavior
+
+  From producer_tests.rs:635: When 1029 pages are requested, copies cap at 1023 and speculative_skips > 0 is asserted.
+
+  VRAM Reduction by Value
+
+  ┌────────────────┬────────────┬────────────────┬───────────────┐
+  │     Value      │ Max Copies │ VRAM Reduction │  Fault Rate   │
+  ├────────────────┼────────────┼────────────────┼───────────────┤
+  │ 1023 (current) │ 1023       │ Baseline       │ Low           │
+  ├────────────────┼────────────┼────────────────┼───────────────┤
+  │ 512            │ 512        │ ~50%           │ Moderate-High │
+  ├────────────────┼────────────┼────────────────┼───────────────┤
+  │ 256            │ 256        │ ~75%           │ High          │
+  ├────────────────┼────────────┼────────────────┼───────────────┤
+  │ 128            │ 128        │ ~87%           │ Very High     │
+  └────────────────┴────────────┴────────────────┴───────────────┘
+
+  Diagnostic Metrics to Monitor
+
+  From ready() tracing output (lines 558-562):
+  - copies - Total numbered copies (direct VRAM indicator)
+  - deferred_speculation (speculative_skips) - How often limit was hit
+  - shader_faults (from_faults) - Copies from page faults
+  - ownership_changes - Other copy sources
+
+  Recommended Approach
+
+  1. Make SPECULATIVE_COPIES configurable via victory.toml or environment variable (default 1023)
+  2. Profile baseline with current value to record speculative_skips, from_faults, and copies count
+  3. Test reduced values (512 → 256) and measure impact on VRAM, frame time, and correctness
+  4. Consider adaptive logic based on detected hardware (lower on integrated GPUs)
+
+  Other Notable Findings
+
+  - Page refusal handling (lines 378-389): Pages consistently refused are tracked and cleared each frame
+  - Fault-based allocation (lines 432-462): Pages without copies are allocated on next frame via take_faults()
+  - Partial copy support (lines 409-421): Allows confirmed accesses to expand coverage after speculative limit hit
+  - Reconciliation loop (lines 287-329): Per-frame optimization that clears refused set and checks generation changes
+
+  All analysis was performed without requiring project installation - derived entirely from code review of the existing
+  repository.
+
+  ---
+
+  Files analyzed:
+  - crates/victory-gpu/src/memory.rs - Core memory management
+  - crates/victory-gpu/src/memory/raw_store_probe.rs - VRAM metrics (exact_guest_bytes, dirty_pages_4k, owner_slots)
+  - crates/victory-gpu/src/memory/producer_tests.rs - Test verification
+  - crates/victory-gpu/src/descriptor/host.rs - FIRST_RAW_PAGE_SLOTS = 1024
+  - crates/victory-hle/src/modules/display.rs - Presentation layer
+  - victory.example.toml - Configuration
