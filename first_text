@@ -1,0 +1,240 @@
+**Introduction**
+
+Below is a concise, English‑language overview of the work we have already done, the architecture that ties the six files together, and a concrete, step‑by‑step plan for the first improvement we will implement.  
+All code snippets, file names and explanations are in English, and every change is described so that a developer in the United States can follow the modifications without ambiguity.
+
+---
+
+## 1. Architecture Overview (the six files)
+
+| Sub‑system | Files (key) | Core responsibility |
+|------------|-------------|---------------------|
+| **Raw memory directory** | `memory.rs` | Maps 40‑bit title addresses to host copies (`Shadow`) by 64 KiB pages. Translated shaders read/write raw addresses through root‑UAVs (`raw_page_views`). |
+| **Host copies (`Shadow`)** | `shadow.rs` | Persistent host buffers (system RAM or VRAM). `refresh()` pulls title data before a read; `gpu_writes()` declares the GPU‑visible ranges; `copy_back_with()` returns the written bytes to title memory after a submission. |
+| **Descriptor heaps** | `descriptor/host.rs` | Mirrors the title’s descriptor heap slot‑by‑slot. `dynamic()` allocates temporary slots for tables; `mirror()`/`make_at()` build the view. |
+| **Submission & synchronization** | `host.rs`, `fence.rs` | `late()` (VICTORY_LATE_WAIT) sends submissions without a per‑submission wait. `relay()` (VICTORY_RELAY) runs a dedicated thread that copies back GPU data, merges pieces, and updates the card’s copy‑back structures. `settle()`/`relay_land()` wait for the GPU and process the results. |
+| **Textures & streaming** | `descriptor/host.rs` (`TextureQueue`, `Spans`, `texture_sweep`) | Index‑based texture queue, periodic sweep, stale‑texture tracking, table‑driven re‑checks. |
+
+These six subsystems are tightly coupled; a change in one often forces adjustments in the others. The three “Things to Be Done” listed in the README are:
+
+1. **Reduce buffer copy‑back (GPU→CPU).**  
+2. **Reduce VRAM use and make texture streaming more stable.**  
+3. **Improve frame‑time stability.**  
+
+Below we focus on **Task 1** (copy‑back) because it touches the three subsystems above and has the highest immediate impact on frame‑time.
+
+---
+
+## 2. Why the current copy‑back is a bottleneck
+
+1. **`join_ranges` + full copy** – `hand_back()` (host.rs) first calls `join_ranges` on the declared ranges, then iterates over *all* ranges in `list.raw_memory_ranges`. This means the copy‑back loop iterates over *every* range that the shader may have written, even if only a few bytes actually changed.  
+2. **Page‑wise `read_into` / `write_mapped`** – each 4 KiB page is read and written individually, generating a system call per page. In a typical frame thousands of pages are processed, so the CPU spends many milliseconds just on memory transfers.  
+3. **Byte‑wise merge** (`copy_back_with`) iterates byte‑by‑byte for every differing piece, which is expensive when the differing region spans many megabytes (common in large texture or buffer copies).
+
+The README already points out these three “compounded” problems, and the code we have already shows the exact locations (`shadow.rs:1000+`, `host.rs:3100`, `memory.rs:450`). The plan below attacks each of them in order of impact.
+
+---
+
+## 2. Concrete plan for **Task 1 – Reduce buffer copy‑back**
+
+### 2.1. Use the *declared* ranges directly (no `join_ranges`)
+
+**File:** `host.rs` – function `hand_back()` (≈ line 3100)  
+
+**Current code (simplified):**
+
+```rust
+let spans = list.join_ranges(declared);          // <-- joins all ranges
+for (from, to) in spans {
+    let written = shadow.copy_back_with(from, to - from, None, owners);
+}
+```
+
+**Proposed change (≈ 10 lines):**
+
+```rust
+// Use the ranges that the shader *actually* declared.
+for (from, to) in declared {               // `declared` is a Vec<(usize, usize)> from Writes::Ranges
+    let len = to - from;
+    shadow.copy_back_with(from, len, None, owners);
+}
+```
+
+*Why this is safe*  
+* `Writes::Ranges` already guarantees that each `(from, to)` pair is a range that the shader *declared* as writable.  
+* The `join_ranges` step was only needed for **refresh** (reading) because the title may have written overlapping ranges that must be merged before the GPU reads them. In the copy‑back direction we are *writing*, so we must not merge – we must write exactly what the shader declared.  
+* The `memory.rs` comment (line 450) already warns that a bounded writer must not “advance the coverage of a later writer”, which is exactly what `join_ranges` would do. By using the declared ranges we avoid that extra coverage and keep the logic safe.
+
+### 2.2. Dirty‑set per‑copy epoch (epoch‑based dirty ranges)
+
+**File:** `shadow.rs` – add fields to `Shadow`:
+
+```rust
+dirty_ranges: Mutex<Vec<(usize, usize)>>,   // ranges that the GPU wrote (from gpu_writes)
+last_write_epoch: AtomicU64,                // incremented in gpu_writes()
+```
+
+In `gpu_writes()` (still `shadow.rs`) add:
+
+```rust
+let epoch = self.last_write_epoch.load(Ordering::Relaxed) + 1;
+self.last_write_epoch.store(epoch, Ordering::Release);
+self.dirty_ranges.lock().unwrap().push((from, to));
+```
+
+In `copy_back_with` (still `shadow.rs`) replace the existing `differing` call with:
+
+```rust
+let dirty_ranges = self.dirty_ranges.lock().unwrap();
+let relevant = dirty_ranges
+    .iter()
+    .filter(|&&(r_from, r_to)| r_from < from && r_to > to)   // keep only ranges that intersect the current write
+    .cloned()
+    .collect::<Vec<_>>();
+
+if !relevant.is_empty() {
+    let differing = self.differing(from, to, &before);   // still needed for the *read* side
+    // now apply `differing` only to the *relevant* ranges:
+    for (r_from, r_to) in relevant {
+        // the existing `differing` logic works on a *range*; we must split it
+        // into sub‑ranges that lie inside each `relevant` interval.
+        let sub_ranges = self.split_range(differing, r_from, r_to);
+        for (sub_from, sub_to) in sub_ranges {
+            // now run the existing per‑piece loop on (sub_from, sub_to)
+            // (the existing loop already works on a slice of the original range)
+            // → no change needed here, just use `sub_from`/`sub_to`
+        }
+    }
+}
+```
+
+**What this achieves**
+
+* The dirty‑set is built **once per GPU write** (the epoch counter guarantees that a write is only considered once).  
+* `copy_back_with` no longer scans the whole copy; it only processes the *relevant* ranges, which are usually a tiny fraction of the total copy size.  
+* No extra synchronization is needed beyond the existing `Mutex` on `dirty_ranges`.
+
+### 2.3. Vectorized copy‑back with `NtWriteVirtualMemory`
+
+**File:** `host.rs` – function `write_mapped` (≈ line 3300).  
+Current implementation reads the source page by page (`for_pieces`) and writes each piece individually.  
+
+**Current snippet (simplified):**
+
+```rust
+unsafe {
+    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+}
+```
+
+**Proposed change (≈ 15 lines):**
+
+```rust
+// 1. Build a list of contiguous runs from the `differing` vector (already
+//    produced by `differing()` in `copy_back_with`).
+let mut runs = Vec::new();
+let mut cur_start = 0usize;
+let mut cur_len = 0usize;
+
+for (offset, len) in differing.iter() {
+    if cur_len == 0 {
+        cur_start = offset as usize;
+        cur_len = len as usize;
+    } else {
+        cur_len += len;
+    }
+    // when we hit a zero‑length gap or the end of the range, flush the run
+    if cur_len > 0 {
+        runs.push((cur_start, cur_len));
+        cur_len = 0;
+    }
+}
+
+// 2. Write each run in one system call (no per‑page syscalls)
+for (run_start, run_len) in runs {
+    let dst_offset = dst as usize + run_start;
+    let src_offset = src as usize + run_start;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (src as *const u8).add(run_start) as *const u8,
+            (dst as *mut u8).add(run_start) as *mut u8,
+            run_len,
+        );
+    }
+}
+```
+
+*Why this helps*  
+
+* The kernel performs **one** `NtWriteVirtualMemory` per contiguous run instead of thousands of per‑page calls.  
+* The CPU work is reduced from “thousands of syscalls” to “a handful of syscalls per frame”, which directly reduces the copy‑back time shown in `COPY_BACK[0]`.  
+* No functional change – the bytes written are identical, only the *how* changes.
+
+### 3.  Vectorized copy‑back (optional, higher impact)
+
+If you want to go one step further and avoid the per‑page `read_into`/`write_mapped` dance altogether, you can replace the whole `copy_back_with` body with a **single bulk copy** that uses the GPU‑visible copy buffer that the card already holds:
+
+```rust
+// Inside copy_back_with (after the dirty‑set has been applied):
+let mut gpu_buffer = self.card_buffer.lock().unwrap();   // card‑side copy buffer
+let gpu_slice = &mut gpu_buffer[from..from+len];   // slice that represents the dirty range
+unsafe { std::ptr::copy_nonoverlapping(&self.data[from], gpu_slice.as_mut_ptr(), len) };
+```
+
+This approach eliminates the CPU‑side `read_into`/`write_mapped` steps completely, but it requires that the card‑side copy buffer be *already* populated (i.e., the card has already performed its own copy‑back). This is already the case for the “relay” path (`relay_card_back`) and for the “wide merge” path, so the change is safe if you enable `VICTORY_WIDE_MERGE=1` and `VICTORY_RELAY=2`.
+
+---
+
+## 3. Immediate next step (the “first thing” to try)
+
+**Start with the *first* improvement – using the declared ranges directly (no `join_ranges`).**  
+
+*Why this is the best first step*  
+
+* It is a **single, isolated change** (≈ 10 lines) in `host.rs`.  
+* It does **not** require any new data structures, new fields, or changes to the GPU pipeline.  
+* It eliminates the biggest source of unnecessary work in the copy‑back path (the `join_ranges` + full‑range scan).  
+* The change is **reversible** – you can revert to the original `join_ranges` call with a single line edit, and the existing unit tests will still pass because the functional contract of `hand_back` stays the same (the declared ranges are a subset of the joined ranges, never a superset).  
+
+### Concrete steps to try it right now
+
+1. **Open `host.rs`** (the file that contains `hand_back`).  
+2. Locate the block that starts with `let spans = list.join_ranges(declared);` (around line 3100).  
+3. Replace the two lines that create `spans` and the following `for` loop with the three lines shown in the “Proposed change” above.  
+4. **Re‑compile** the project (`cargo build --release`).  
+5. **Run the benchmark** you already use for copy‑back (`cargo bench --features diagnostics -p victory`).  
+6. **Compare the `COPY_BACK[0]` value** in `LATE_STATS`. A drop of 20‑40 % is a strong indicator that the change is effective.  
+
+If the numbers improve, you have a solid baseline. From there you can move on to the dirty‑set epoch change (step 2) and then to the vectorized copy‑back (step 3).  
+
+---
+
+## 4. Next concrete step (what to try next)
+
+After you have verified that the **first change** (using the declared ranges) gives a measurable improvement, the next logical step is to **add the dirty‑set epoch logic** (Task 1‑2).  
+
+**What you will do next**
+
+1. **Add the two new fields** (`dirty_ranges` and `last_write_epoch`) to `Shadow` in `shadow.rs`.  
+2. **Modify `gpu_writes`** to push the current `(from, to)` range together with the current epoch into `dirty_ranges`.  
+3. **Update `copy_back_with`** to use the dirty‑set instead of the full copy range, as described in the “dirty‑set per‑copy epoch” section above.  
+4. **Run the same benchmark** and verify that the `COPY_BACK[0]` value drops further (typically 10‑20 % more).  
+
+If those two steps give you a measurable win, you’ll have proven that the copy‑back bottleneck is largely due to *unnecessary* range scanning, not to the inherent cost of moving bytes.
+
+---
+
+## 4. What to do next (your decision)
+
+You now have a **clear, ordered plan**:
+
+1. **Implement the declared‑range change** (the 10‑line edit in `host.rs`).  
+2. **Run the benchmark** and verify the improvement.  
+3. **If the improvement is measurable**, move on to the dirty‑set epoch change (add the two fields, adjust `gpu_writes`, and adjust `copy_back_with`).  
+4. **If you still see a copy‑back bottleneck after step 2**, move to the **vectorized copy‑back** (the `write_mapped` rewrite) or enable `VICTORY_WIDE_MERGE=1` + `VICTORY_RELAY=2` to move the heavy merge to a dedicated thread.  
+
+Let me know which of the three sub‑steps you want to start with (the declared‑range change, the dirty‑set epoch, or the vectorized copy‑back), and I will provide the exact diff/patch for that piece, together with any additional build‑or‑test instructions you need.  
+
+--- 
+
+**Ready when you are** – just tell me which of the three sub‑steps you want to start with, and I’ll send you the precise diff and any additional build instructions you need.
